@@ -1,68 +1,186 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
+
 <head>
-<meta charset="utf-8">
-<title>RemoteP2P WebUI</title>
-<style>
-*{box-sizing:border-box;font-family:system-ui}
-body{max-width:1100px;margin:20px auto;padding:0 16px;background:#f7f8fa;color:#222}
-.card{background:#fff;border-radius:12px;padding:16px;margin:12px 0;box-shadow:0 2px 8px #00000012}
-.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
-input,button,textarea{padding:8px 10px;font-size:14px;border-radius:6px;border:1px solid #ddd}
-button{background:#2563eb;color:#fff;border:0;cursor:pointer}
-button:disabled{background:#94a3b8}
-#log{height:240px;overflow:auto;background:#111;color:#8cf;padding:10px;font-family:monospace;font-size:12px}
-.badge{font-size:12px;padding:3px 6px;border-radius:999}
-.ok{background:#dcfce7;color:#166534}
-.warn{background:#fffbeb;color:#92400e}
-.no{background:#fee2e2;color:#991b1b}
-</style>
+    <meta charset="utf-8">
+    <title>RemoteP2P WebUI</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            font-family: system-ui
+        }
+
+        body {
+            max-width: 1100px;
+            margin: 20px auto;
+            padding: 0 16px;
+            background: #f7f8fa;
+            color: #222
+        }
+
+        .card {
+            background: #fff;
+            border-radius: 12px;
+            padding: 16px;
+            margin: 12px 0;
+            box-shadow: 0 2px 8px #00000012
+        }
+
+        .row {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            align-items: center
+        }
+
+        input,
+        button,
+        textarea {
+            padding: 8px 10px;
+            font-size: 14px;
+            border-radius: 6px;
+            border: 1px solid #ddd
+        }
+
+        button {
+            background: #2563eb;
+            color: #fff;
+            border: 0;
+            cursor: pointer
+        }
+
+        button:disabled {
+            background: #94a3b8
+        }
+
+        #log {
+            height: 240px;
+            overflow: auto;
+            background: #111;
+            color: #8cf;
+            padding: 10px;
+            font-family: monospace;
+            font-size: 12px
+        }
+
+        #eventLog {
+            height: 220px;
+            overflow: auto;
+            background: #0f172a;
+            color: #a5f3fc;
+            padding: 10px;
+            font-family: monospace;
+            font-size: 12px
+        }
+
+        .badge {
+            font-size: 12px;
+            padding: 3px 6px;
+            border-radius: 999
+        }
+
+        .ok {
+            background: #dcfce7;
+            color: #166534
+        }
+
+        .warn {
+            background: #fffbeb;
+            color: #92400e
+        }
+
+        .no {
+            background: #fee2e2;
+            color: #991b1b
+        }
+
+        pre {
+            white-space: pre-wrap
+        }
+    </style>
 </head>
+
 <body>
-<h1>RemoteP2P</h1>
-<div class="card">
-<h3>平台能力</h3>
-<div id="cap"></div>
-</div>
-<div class="card">
-<h3>剪贴板发送</h3>
-<textarea id="clipText" rows="4" style="width:100%" placeholder="输入文本发送到对等节点"></textarea>
-<div class="row">
-<button onclick="sendClip()">发送剪贴板文本</button>
-<button onclick="readClip()">读取本机剪贴板</button>
-</div>
-</div>
-<div class="card">
-<h3>任务列表</h3>
-<div id="taskList"></div>
-</div>
-<div class="card">
-<h3>日志</h3>
-<div id="log"></div>
-</div>
-<script>
-const logDiv = document.getElementById('log');
-function log(s){
-  logDiv.innerHTML += new Date().toLocaleTimeString() + ' ' + s + '
-';
-  logDiv.scrollTop = logDiv.scrollHeight;
-}
-function sendClip(){
-  const v = document.getElementById('clipText').value;
-  log('send clip: ' + v);
-}
-function readClip(){
-  log('read clipboard from local');
-}
-function renderCap(){
-  const ua = navigator.userAgent;
-  let cap = '';
-  if(ua.includes('Win')) cap = '<span class="badge ok">Win:文本/图片/文件剪贴板+全局热键</span>';
-  else if(ua.includes('Mac')) cap = '<span class="badge warn">macOS PureGo:仅文本剪贴板</span> <span class="badge ok">macOS CGO:完整剪贴板</span>';
-  else cap = '<span class="badge warn">Linux:文本剪贴板</span>';
-  document.getElementById('cap').innerHTML = cap;
-}
-renderCap();
-</script>
+    <h1>RemoteP2P</h1>
+    <div class="card">
+        <h3>平台能力</h3>
+        <div id="cap"></div>
+    </div>
+    <div class="card">
+        <h3>剪贴板</h3>
+        <textarea id="clipText" rows="4" style="width:100%" placeholder="输入文本发送到对等节点"></textarea>
+        <div class="row">
+            <button onclick="readClip()">读取本机剪贴板</button>
+            <button onclick="sendClipText()">发送文本</button>
+        </div>
+        <pre id="clipPreview"></pre>
+    </div>
+    <div class="card">
+        <h3>实时事件（WebSocket）</h3>
+        <div id="eventLog"></div>
+    </div>
+    <div class="card">
+        <h3>任务列表</h3>
+        <div id="taskList"></div>
+    </div>
+    <div class="card">
+        <h3>日志</h3>
+        <div id="log"></div>
+    </div>
+    <script>
+        const logDiv = document.getElementById('log');
+        const eventDiv = document.getElementById('eventLog');
+        let ws;
+
+        function log (s) {
+            logDiv.innerHTML += new Date().toLocaleTimeString() + ' ' + s + '\n';
+            logDiv.scrollTop = logDiv.scrollHeight;
+        }
+        function evLog (s) {
+            eventDiv.innerHTML += new Date().toLocaleTimeString() + ' ' + s + '\n';
+            eventDiv.scrollTop = eventDiv.scrollHeight;
+        }
+
+        function connectWS () {
+            const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            ws = new WebSocket(`${proto}//${location.host}/ws`);
+            ws.onopen = () => evLog("✅ WS connected");
+            ws.onclose = () => {
+                evLog("❌ WS closed, reconnect...");
+                setTimeout(connectWS, 2000);
+            };
+            ws.onmessage = (e) => {
+                const ev = JSON.parse(e.data);
+                evLog(`[${ev.type}] from ${ev.From || ev.from}: ${JSON.stringify(ev.Data || ev.data)}`);
+            };
+        }
+        connectWS();
+
+        async function readClip () {
+            const res = await fetch('/api/clip/read');
+            const data = await res.json();
+            document.getElementById('clipText').value = data.text;
+            document.getElementById('clipPreview').innerText = JSON.stringify(data, null, 2);
+            log('读取剪贴板成功');
+        }
+        async function sendClipText () {
+            const text = document.getElementById('clipText').value;
+            await fetch('/api/clip/send/text', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ text })
+            })
+            log('发送剪贴板文本：' + text);
+        }
+        function renderCap () {
+            const ua = navigator.userAgent;
+            let cap = '';
+            if (ua.includes('Win')) cap = '<span class="badge ok">Win:文本+图片+文件剪贴板</span>';
+            else if (ua.includes('Mac')) cap = '<span class="badge warn">macOS PureGo:仅文本</span> <span class="badge ok">macOS CGO:文本+图片+文件</span>';
+            else cap = '<span class="badge warn">Linux:xclip 文本+图片+uri文件列表</span>';
+            document.getElementById('cap').innerHTML = cap;
+        }
+        renderCap();
+    </script>
 </body>
 </html>

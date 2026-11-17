@@ -8,7 +8,8 @@ QUIC P2P 跨平台传输工具
 - 图片自动缩略图缓存
 - 内置 WebUI（go:embed），剪贴板发送、任务面板、平台能力提示
 - CSV 传输历史记录
-- 跨平台：Win11 x86_64、银河麒麟V10 arm64、macOS amd64/arm64
+- 剪贴板：文本 / 图片 / 文件列表跨设备同步
+- 跨平台：Win11 x86_64、银河麒麟V10 arm64、macOS amd64/arm64、Linux
 
 📌 编译规则
 - Windows / 麒麟 arm64：CGO_ENABLED=0，静态独立二进制

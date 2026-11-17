@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/quic-go/quic-go"
 	"remotep2p/internal/codec"
@@ -15,26 +16,47 @@ import (
 )
 
 type PeerSession struct {
-	ctx      context.Context
-	conn     quic.Connection
-	ctrlStr  quic.Stream
-	token    string
-	resumeSt *resume.Store
-	taskMgr  *TaskManager
-	recvDir  string
-	thumbDir string
+	ctx         context.Context
+	conn        quic.Connection
+	ctrlStr     quic.Stream
+	token       string
+	resumeSt    *resume.Store
+	taskMgr     *TaskManager
+	recvDir     string
+	thumbDir    string
+	eventHub    *EventHub
+	peerBucket  *TokenBucket
+	globalBucket *TokenBucket
+	traffic     *TrafficStat
+	globalTraffic *TrafficStat
 }
 
-func NewPeerSession(ctx context.Context, conn quic.Connection, ctrlStr quic.Stream, token string, rs *resume.Store, tm *TaskManager, recvDir, thumbDir string) *PeerSession {
+func NewPeerSession(
+	ctx context.Context,
+	conn quic.Connection,
+	ctrlStr quic.Stream,
+	token string,
+	rs *resume.Store,
+	tm *TaskManager,
+	recvDir, thumbDir string,
+	eh *EventHub,
+	peerBucket, globalBucket *TokenBucket,
+	globalTraffic *TrafficStat,
+) *PeerSession {
 	return &PeerSession{
-		ctx:      ctx,
-		conn:     conn,
-		ctrlStr:  ctrlStr,
-		token:    token,
-		resumeSt: rs,
-		taskMgr:  tm,
-		recvDir:  recvDir,
-		thumbDir: thumbDir,
+		ctx:           ctx,
+		conn:          conn,
+		ctrlStr:       ctrlStr,
+		token:         token,
+		resumeSt:      rs,
+		taskMgr:       tm,
+		recvDir:       recvDir,
+		thumbDir:      thumbDir,
+		eventHub:      eh,
+		peerBucket:    peerBucket,
+		globalBucket:  globalBucket,
+		traffic:       &TrafficStat{},
+		globalTraffic: globalTraffic,
 	}
 }
 
@@ -56,26 +78,24 @@ func (s *PeerSession) Handshake() bool {
 	return true
 }
 
-func (s *PeerSession) Run() {
-	defer s.conn.CloseWithError(0, "session exit")
-	for {
-		f, err := codec.ReadFrame(s.ctrlStr)
-		if err == io.EOF {
-			return
-		}
-		if err != nil {
-			fmt.Println("ctrl read err:", err)
-			return
-		}
-		s.onCtrlFrame(f)
-	}
-}
-
 func (s *PeerSession) onCtrlFrame(f *codec.Frame) {
+	from := s.conn.RemoteAddr().String()
 	switch f.FrameType {
 	case codec.FrameClipText:
-		fmt.Printf("recv clip text: %s
-", string(f.Body))
+		fmt.Printf("[ClipText] peer: %s\n%s\n", from, string(f.Body))
+		raw, _ := json.Marshal(map[string]any{"text": string(f.Body)})
+		s.eventHub.Publish(&Event{Type: EvClipText, From: from, Data: raw})
+	case codec.FrameClipImage:
+		fmt.Printf("[ClipImage] peer: %s, png len: %d\n", from, len(f.Body))
+		raw, _ := json.Marshal(map[string]any{"size": len(f.Body)})
+		s.eventHub.Publish(&Event{Type: EvClipImage, From: from, Data: raw})
+	case codec.FrameClipFiles:
+		var list []string
+		if err := json.Unmarshal(f.Body, &list); err == nil {
+			fmt.Printf("[ClipFiles] peer: %s, files: %+v\n", from, list)
+			raw, _ := json.Marshal(map[string]any{"files": list})
+			s.eventHub.Publish(&Event{Type: EvClipFiles, From: from, Data: raw})
+		}
 	case codec.FrameTaskReq:
 		go s.startRecvTask(f)
 	case codec.FrameTaskResume:
@@ -85,9 +105,49 @@ func (s *PeerSession) onCtrlFrame(f *codec.Frame) {
 	case codec.FrameTaskDone:
 		s.taskMgr.MarkDone(f.BatchID)
 		_ = s.resumeSt.Delete(f.BatchID)
+		raw, _ := json.Marshal(map[string]any{"batch_id": fmt.Sprintf("%x", f.BatchID)})
+		s.eventHub.Publish(&Event{Type: EvTaskDone, From: from, Data: raw})
 	case codec.FrameTaskErr:
-		fmt.Printf("task %x error: %s
-", f.BatchID, string(f.Body))
+		fmt.Printf("task %x error: %s\n", f.BatchID, string(f.Body))
+		raw, _ := json.Marshal(map[string]any{"batch_id": fmt.Sprintf("%x", f.BatchID), "err": string(f.Body)})
+		s.eventHub.Publish(&Event{Type: EvTaskError, From: from, Data: raw})
+	}
+}
+
+// WriteFrame 发送前限流 + 统计tx
+func (s *PeerSession) WriteFrame(f *codec.Frame) error {
+	bs, err := codec.MarshalFrame(f)
+	if err != nil {
+		return err
+	}
+	n := int64(len(bs))
+	if s.peerBucket != nil {
+		s.peerBucket.Take(n)
+	}
+	if s.globalBucket != nil {
+		s.globalBucket.Take(n)
+	}
+	_, err = s.ctrlStr.Write(bs)
+	s.traffic.AddTx(n)
+	s.globalTraffic.AddTx(n)
+	return err
+}
+
+func (s *PeerSession) Run() {
+	defer s.conn.CloseWithError(0, "session exit")
+	buf := make([]byte, 65536)
+	for {
+		f, err := codec.ReadFrame(s.ctrlStr, buf)
+		if err != nil {
+			if err != io.EOF {
+				fmt.Println("read frame err:", err)
+			}
+			return
+		}
+		rxN := int64(codec.FrameSize(f))
+		s.traffic.AddRx(rxN)
+		s.globalTraffic.AddRx(rxN)
+		s.onCtrlFrame(f)
 	}
 }
 
@@ -192,7 +252,6 @@ func (s *PeerSession) startRecvTask(f *codec.Frame) {
 			return
 		}
 	}
-	// final checksum
 	gotHash, err := transfer.FileSha256(meta.RecvPath)
 	if err != nil || gotHash != meta.Sha256 {
 		errFrame := &codec.Frame{
@@ -204,7 +263,6 @@ func (s *PeerSession) startRecvTask(f *codec.Frame) {
 		_ = codec.WriteFrame(s.ctrlStr, errFrame)
 		return
 	}
-	// try thumbnail
 	thumbPath := transfer.ThumbPath(s.thumbDir, fmt.Sprintf("%x", bid))
 	_ = transfer.GenThumbnail(meta.RecvPath, thumbPath)
 	doneFrame := &codec.Frame{

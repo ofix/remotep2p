@@ -6,9 +6,10 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
-	"remotep2p/config"
+	"remotep2p/internal/config"
 	"remotep2p/internal/node"
 	"remotep2p/internal/web"
 )
@@ -59,9 +60,10 @@ func main() {
 		TLSConf:    tlsConf,
 	}
 
+	n := node.NewNode(cfg)
+	web.SetNode(n)
 	go web.StartHTTPS(cfg)
 
-	n := node.NewNode(cfg)
 	if err := n.Start(ctx); err != nil {
 		fmt.Println("node start err:", err)
 	}

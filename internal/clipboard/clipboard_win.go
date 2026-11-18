@@ -1,4 +1,5 @@
 //go:build windows
+
 package clipboard
 
 import (
@@ -59,7 +60,7 @@ func (w *WinClip) ReadImage() ([]byte, error) {
 	width := int32(bm.BmWidth)
 	height := int32(bm.BmHeight)
 	bitCount := uint16(24)
-	rowLen := ((width * int32(bitCount) + 31) >> 5) << 2
+	rowLen := ((width*int32(bitCount) + 31) >> 5) << 2
 
 	info := windows.BITMAPINFO{
 		BmiHeader: windows.BITMAPINFOHEADER{

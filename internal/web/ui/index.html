@@ -95,7 +95,19 @@
         }
 
         pre {
-            white-space: pre-wrap
+            white-space: pre-wrap;
+            overflow-x: auto;
+            max-height: 180px;
+            background: #f1f5f9;
+            padding: 8px;
+            border-radius: 6px;
+        }
+
+        .img-preview {
+            max-width: 100%;
+            max-height: 300px;
+            border-radius: 6px;
+            cursor: zoom-in;
         }
     </style>
 </head>
@@ -103,7 +115,7 @@
 <body>
     <h1>RemoteP2P</h1>
     <div class="card">
-        <h3>平台能力</h3>
+        <h3>平台能力｜流量 <span id="rx">0 B</span> / <span id="tx">0 B</span></h3>
         <div id="cap"></div>
     </div>
     <div class="card">
@@ -114,6 +126,7 @@
             <button onclick="sendClipText()">发送文本</button>
         </div>
         <pre id="clipPreview"></pre>
+        <div id="clipImgBox"></div>
     </div>
     <div class="card" style="padding:12px;margin:8px 0;background:#fff;border-radius:10px;border:1px solid #e5e7eb;">
         <div style="font-weight:bold;margin-bottom:8px;">在线节点</div>
@@ -136,6 +149,21 @@
         const eventDiv = document.getElementById('eventLog');
         let ws;
         let peers = new Map();
+        let tasks = new Map();
+        let isReconnecting = false;
+        const MAX_LOG_LINE = 200;
+
+        function formatBytes(bytes) {
+            if (!bytes || bytes === 0) return "0 B";
+            const units = ["B", "KB", "MB", "GB", "TB"];
+            let i = 0;
+            let v = bytes;
+            while (v >= 1024 && i < units.length - 1) {
+                v /= 1024;
+                i++;
+            }
+            return v.toFixed(2) + " " + units[i];
+        }
 
         function renderPeerList() {
             const wrap = document.getElementById("peerList");
@@ -156,75 +184,126 @@
             wrap.innerHTML = html;
         }
 
+        function renderTaskList() {
+            const wrap = document.getElementById("taskList");
+            if (tasks.size === 0) {
+                wrap.innerHTML = "<div style='color:#666'>暂无传输任务</div>";
+                return;
+            }
+            let html = "";
+            for (const [bid, t] of tasks) {
+                const pct = t.percent ?? 0;
+                const errHtml = t.error ? `<div style="color:#dc2626">错误：${t.error}</div>` : "";
+                html += `
+    <div style="padding:8px;background:#f8fafc;border-radius:6px;margin:4px 0;">
+      <div>批次:${bid} | ${t.name ?? "-"}</div>
+      <div style="height:6px;background:#ddd;border-radius:3px;margin:4px 0;overflow:hidden;">
+        <div style="width:${pct}%;height:100%;background:#2563eb;"></div>
+      </div>
+      <div>${pct.toFixed(1)}% ${errHtml}</div>
+    </div>`;
+            }
+            wrap.innerHTML = html;
+        }
 
         function log(s) {
             logDiv.innerHTML += new Date().toLocaleTimeString() + ' ' + s + '\n';
+            const lines = logDiv.innerHTML.split("\n");
+            if (lines.length > MAX_LOG_LINE) logDiv.innerHTML = lines.slice(-MAX_LOG_LINE).join("\n");
             logDiv.scrollTop = logDiv.scrollHeight;
         }
         function evLog(s) {
             eventDiv.innerHTML += new Date().toLocaleTimeString() + ' ' + s + '\n';
+            const lines = eventDiv.innerHTML.split("\n");
+            if (lines.length > MAX_LOG_LINE) eventDiv.innerHTML = lines.slice(-MAX_LOG_LINE).join("\n");
             eventDiv.scrollTop = eventDiv.scrollHeight;
         }
 
         function connectWS() {
+            if (isReconnecting) return;
+            isReconnecting = true;
             const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
             ws = new WebSocket(`${proto}//${location.host}/ws`);
-            ws.onopen = () => evLog("✅ WS connected");
+            ws.onopen = () => {
+                evLog("✅ WS connected");
+                isReconnecting = false;
+            };
             ws.onclose = () => {
                 evLog("❌ WS closed, reconnect...");
+                isReconnecting = false;
                 setTimeout(connectWS, 2000);
             };
             ws.onmessage = (e) => {
-                const ev = JSON.parse(e.data);
-                evLog(`[${ev.type}] ${JSON.stringify(ev.data)}`);
+                try {
+                    const ev = JSON.parse(e.data);
+                    evLog(`[${ev.type}] ${JSON.stringify(ev.data)}`);
 
-                if (ev.type === "traffic_stats") {
-                    const g = ev.data.global;
-                    document.getElementById('rx').innerText = formatBytes(g.rx);
-                    document.getElementById('tx').innerText = formatBytes(g.tx);
-                } else if (ev.type === "task_start") {
-                    tasks.set(ev.data.batch_id, { ...ev.data, error: null });
-                    renderTaskList();
-                } else if (ev.type === "task_progress") {
-                    const t = tasks.get(ev.data.batch_id);
-                    if (t) tasks.set(ev.data.batch_id, { ...t, ...ev.data });
-                    renderTaskList();
-                } else if (ev.type === "task_done") {
-                    const t = tasks.get(ev.data.batch_id, { ...ev.data, percent: 100 });
-                    if (t) tasks.set(ev.data.batch_id, { ...t, percent: 100 });
-                    renderTaskList();
-                    setTimeout(() => { tasks.delete(ev.data.batch_id); renderTaskList() }, 3000);
-                } else if (ev.type === "task_error") {
-                    const t = tasks.get(ev.data.batch_id);
-                    if (t) tasks.set(ev.data.batch_id, { ...t, error: ev.data.err });
-                    renderTaskList();
-                } else if (ev.type === "discovery_peer") {
-                    peers.set(ev.data.addr, ev.data);
-                    renderPeerList();
-                } else if (ev.type === "peer_down") {
-                    peers.delete(ev.data.addr);
-                    renderPeerList();
+                    if (ev.type === "traffic_stats") {
+                        const g = ev.data.global;
+                        document.getElementById('rx').innerText = formatBytes(g.rx);
+                        document.getElementById('tx').innerText = formatBytes(g.tx);
+                    } else if (ev.type === "task_start") {
+                        tasks.set(ev.data.batch_id, { ...ev.data, percent: 0, error: null });
+                        renderTaskList();
+                    } else if (ev.type === "task_progress") {
+                        const t = tasks.get(ev.data.batch_id);
+                        if (t) tasks.set(ev.data.batch_id, { ...t, ...ev.data });
+                        renderTaskList();
+                    } else if (ev.type === "task_done") {
+                        const t = tasks.get(ev.data.batch_id);
+                        if (t) {
+                            tasks.set(ev.data.batch_id, { ...t, ...ev.data, percent: 100 });
+                            renderTaskList();
+                        }
+                        setTimeout(() => { tasks.delete(ev.data.batch_id); renderTaskList() }, 3000);
+                    } else if (ev.type === "task_error") {
+                        const t = tasks.get(ev.data.batch_id);
+                        if (t) tasks.set(ev.data.batch_id, { ...t, error: ev.data.err });
+                        renderTaskList();
+                    } else if (ev.type === "peer_up") {
+                        peers.set(ev.data.addr, ev.data);
+                        renderPeerList();
+                    } else if (ev.type === "peer_down") {
+                        peers.delete(ev.data.addr);
+                        renderPeerList();
+                    }
+                } catch (err) {
+                    evLog("消息解析异常:" + err.message);
                 }
             };
-
         }
         connectWS();
 
         async function readClip() {
-            const res = await fetch('/api/clip/read');
-            const data = await res.json();
-            document.getElementById('clipText').value = data.text;
-            document.getElementById('clipPreview').innerText = JSON.stringify(data, null, 2);
-            log('读取剪贴板成功');
+            try {
+                const res = await fetch('/api/clip/read');
+                const data = await res.json();
+                document.getElementById('clipText').value = data.text ?? "";
+                document.getElementById('clipPreview').innerText = JSON.stringify(data, null, 2);
+                // 剪贴板图片渲染
+                const imgBox = document.getElementById("clipImgBox");
+                if (data.image) {
+                    imgBox.innerHTML = `<img class="img-preview" src="${data.image}" alt="剪贴板图片">`;
+                } else {
+                    imgBox.innerHTML = "";
+                }
+                log('读取剪贴板成功');
+            } catch (err) {
+                log("读取剪贴板失败:" + err.message);
+            }
         }
         async function sendClipText() {
-            const text = document.getElementById('clipText').value;
-            await fetch('/api/clip/send/text', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ text })
-            })
-            log('发送剪贴板文本：' + text);
+            try {
+                const text = document.getElementById('clipText').value;
+                await fetch('/api/clip/send/text', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ text })
+                })
+                log('发送剪贴板文本：' + text);
+            } catch (err) {
+                log("发送剪贴板失败:" + err.message);
+            }
         }
         function renderCap() {
             const ua = navigator.userAgent;
@@ -235,6 +314,8 @@
             document.getElementById('cap').innerHTML = cap;
         }
         renderCap();
+        renderPeerList();
+        renderTaskList();
     </script>
 </body>
 

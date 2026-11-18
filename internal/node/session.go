@@ -21,9 +21,9 @@ import (
 type PeerSession struct {
 	ctx           context.Context
 	conn          quic.Connection
-	ctrlStr       quic.Stream
+	ctrlStream    quic.Stream
 	token         string
-	resumeSt      *resume.Store
+	resumeStore   *resume.Store
 	taskMgr       *TaskManager
 	recvDir       string
 	thumbDir      string
@@ -37,7 +37,7 @@ type PeerSession struct {
 func NewPeerSession(
 	ctx context.Context,
 	conn quic.Connection,
-	ctrlStr quic.Stream,
+	ctrlStream quic.Stream,
 	token string,
 	rs *resume.Store,
 	tm *TaskManager,
@@ -49,9 +49,9 @@ func NewPeerSession(
 	return &PeerSession{
 		ctx:           ctx,
 		conn:          conn,
-		ctrlStr:       ctrlStr,
+		ctrlStream:    ctrlStream,
 		token:         token,
-		resumeSt:      rs,
+		resumeStore:   rs,
 		taskMgr:       tm,
 		recvDir:       recvDir,
 		thumbDir:      thumbDir,
@@ -71,10 +71,10 @@ func (s *PeerSession) Handshake() bool {
 		Flags:     0,
 		Body:      []byte(s.token),
 	}
-	if err := codec.WriteFrame(s.ctrlStr, frame); err != nil {
+	if err := codec.WriteFrame(s.ctrlStream, frame); err != nil {
 		return false
 	}
-	rsp, err := codec.ReadFrame(s.ctrlStr)
+	rsp, err := codec.ReadFrame(s.ctrlStream)
 	if err != nil || rsp.FrameType != codec.FrameHandshake || string(rsp.Body) != s.token {
 		return false
 	}
@@ -107,7 +107,7 @@ func (s *PeerSession) onCtrlFrame(f *codec.Frame) {
 		s.taskMgr.OnAck(f.BatchID, f.Body)
 	case codec.FrameTaskDone:
 		s.taskMgr.MarkDone(f.BatchID)
-		_ = s.resumeSt.Delete(f.BatchID)
+		_ = s.resumeStore.Delete(f.BatchID)
 		raw, _ := json.Marshal(map[string]any{"batch_id": fmt.Sprintf("%x", f.BatchID)})
 		s.eventHub.Publish(&Event{Type: EvTaskDone, From: from, Data: json.RawMessage(raw)})
 	case codec.FrameTaskErr:
@@ -130,7 +130,7 @@ func (s *PeerSession) WriteFrame(f *codec.Frame) error {
 	if s.globalBucket != nil {
 		s.globalBucket.Take(n)
 	}
-	_, err := s.ctrlStr.Write(buf.Bytes())
+	_, err := s.ctrlStream.Write(buf.Bytes())
 	s.traffic.AddTx(n)
 	s.globalTraffic.AddTx(n)
 	return err
@@ -139,7 +139,7 @@ func (s *PeerSession) WriteFrame(f *codec.Frame) error {
 func (s *PeerSession) Run() {
 	defer s.conn.CloseWithError(0, "session exit")
 	for {
-		f, err := codec.ReadFrame(s.ctrlStr)
+		f, err := codec.ReadFrame(s.ctrlStream)
 		if err != nil {
 			if err != io.EOF {
 				fmt.Println("read frame err:", err)
@@ -181,12 +181,12 @@ func (s *PeerSession) startRecvTask(f *codec.Frame) {
 		Sha256:     req.Sha256,
 	}
 	if (f.Flags & codec.FlagResume) != 0 {
-		old, err := s.resumeSt.Load(bid)
+		old, err := s.resumeStore.Load(bid)
 		if err == nil {
 			meta.Offset = old.Offset
 		}
 	}
-	if err := s.resumeSt.Save(meta); err != nil {
+	if err := s.resumeStore.Save(meta); err != nil {
 		fmt.Println("save resume meta err:", err)
 		return
 	}
@@ -232,7 +232,7 @@ func (s *PeerSession) startRecvTask(f *codec.Frame) {
 				return
 			}
 			meta.Offset += int64(n)
-			_ = s.resumeSt.Save(meta)
+			_ = s.resumeStore.Save(meta)
 			ack := make([]byte, 8)
 			binary.LittleEndian.PutUint64(ack, uint64(meta.Offset))
 			ackFrame := &codec.Frame{
@@ -241,7 +241,7 @@ func (s *PeerSession) startRecvTask(f *codec.Frame) {
 				BodyLen:   8,
 				Body:      ack,
 			}
-			_ = codec.WriteFrame(s.ctrlStr, ackFrame)
+			_ = codec.WriteFrame(s.ctrlStream, ackFrame)
 		}
 		if err == io.EOF {
 			break
@@ -254,7 +254,7 @@ func (s *PeerSession) startRecvTask(f *codec.Frame) {
 				BodyLen:   uint64(len(err.Error())),
 				Body:      []byte(err.Error()),
 			}
-			_ = codec.WriteFrame(s.ctrlStr, errFrame)
+			_ = codec.WriteFrame(s.ctrlStream, errFrame)
 			return
 		}
 	}
@@ -266,7 +266,7 @@ func (s *PeerSession) startRecvTask(f *codec.Frame) {
 			BodyLen:   uint64(len("sha256 mismatch")),
 			Body:      []byte("sha256 mismatch"),
 		}
-		_ = codec.WriteFrame(s.ctrlStr, errFrame)
+		_ = codec.WriteFrame(s.ctrlStream, errFrame)
 		return
 	}
 	thumbPath := transfer.ThumbPath(s.thumbDir, fmt.Sprintf("%x", bid))
@@ -277,5 +277,5 @@ func (s *PeerSession) startRecvTask(f *codec.Frame) {
 		BodyLen:   0,
 		Body:      nil,
 	}
-	_ = codec.WriteFrame(s.ctrlStr, doneFrame)
+	_ = codec.WriteFrame(s.ctrlStream, doneFrame)
 }

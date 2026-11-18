@@ -67,7 +67,7 @@ type PeerMetaInfo struct {
 
 type Node struct {
 	cfg             *config.Config
-	resumeSt        *resume.Store
+	resumeStore     *resume.Store
 	taskMgr         *TaskManager
 	eventHub        *EventHub
 	peersLock       sync.Mutex
@@ -84,7 +84,7 @@ type Node struct {
 func NewNode(cfg *config.Config) *Node {
 	return &Node{
 		cfg:             cfg,
-		resumeSt:        resume.NewStore(cfg.ResumeDir),
+		resumeStore:     resume.NewStore(cfg.ResumeDir),
 		taskMgr:         NewTaskManager(),
 		eventHub:        NewEventHub(),
 		peers:           make(map[string]*PeerSession),
@@ -242,7 +242,7 @@ func (n *Node) handleConn(ctx context.Context, conn quic.Connection) {
 		_ = conn.CloseWithError(0, "open ctrl stream fail")
 		return
 	}
-	sess := NewPeerSession(ctx, conn, ctrlStream, n.cfg.Token, n.resumeSt, n.taskMgr,
+	sess := NewPeerSession(ctx, conn, ctrlStream, n.cfg.Token, n.resumeStore, n.taskMgr,
 		n.cfg.RecvDir, n.cfg.ThumbDir, n.eventHub,
 		NewTokenBucket(n.cfg.PeerRateLimit), n.globalBucket, n.globalTraffic)
 	if !sess.Handshake() {
@@ -299,7 +299,7 @@ func (n *Node) dialPeer(ctx context.Context, addr string) (*PeerSession, error) 
 		_ = conn.CloseWithError(0, "open ctrl stream fail")
 		return nil, err
 	}
-	sess := NewPeerSession(ctx, conn, ctrlStream, n.cfg.Token, n.resumeSt, n.taskMgr,
+	sess := NewPeerSession(ctx, conn, ctrlStream, n.cfg.Token, n.resumeStore, n.taskMgr,
 		n.cfg.RecvDir, n.cfg.ThumbDir, n.eventHub,
 		NewTokenBucket(n.cfg.PeerRateLimit), n.globalBucket, n.globalTraffic)
 	if !sess.Handshake() {

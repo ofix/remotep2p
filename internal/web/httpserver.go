@@ -43,7 +43,7 @@ func GenSelfSignedTLS() (*tls.Config, error) {
 		NotBefore:             time.Now(),
 		NotAfter:              time.Now().AddDate(10, 0, 0),
 		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
 		BasicConstraintsValid: true,
 	}
 	der, err := x509.CreateCertificate(rand.Reader, template, template, &priv.PublicKey, priv)
@@ -84,8 +84,8 @@ func apiClipRead(w http.ResponseWriter, r *http.Request) {
 	files, _ := clipboard.Instance.ReadFileList()
 	img, _ := clipboard.Instance.ReadImage()
 	json.NewEncoder(w).Encode(map[string]any{
-		"text":  text,
-		"files": files,
+		"text":      text,
+		"files":     files,
 		"has_image": img != nil,
 	})
 }

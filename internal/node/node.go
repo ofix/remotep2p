@@ -3,17 +3,16 @@ package node
 import (
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/json"
 	"fmt"
-	"net"
-	"strconv"
+	"log"
 	"strings"
 	"sync"
 	"time"
 
 	"remotep2p/internal/codec"
 	"remotep2p/internal/config"
+	"remotep2p/internal/discovery"
 	"remotep2p/internal/resume"
 
 	"github.com/grandcat/zeroconf"
@@ -79,6 +78,7 @@ type Node struct {
 
 	zcServer *zeroconf.Server
 	zcCancel context.CancelFunc
+	mdns     *discovery.Mdns // 新增，外部mdns实例
 }
 
 func NewNode(cfg *config.Config) *Node {
@@ -110,7 +110,7 @@ func (n *Node) Start(ctx context.Context) error {
 	go n.listenLoop(ctx)
 	go n.trafficReportLoop(ctx)
 
-	// 静态Peer
+	// 静态Peer 保留在Node内部，这部分属于Node启动拨号逻辑
 	for _, addr := range n.cfg.Peers {
 		addr = strings.TrimSpace(addr)
 		if addr != "" {
@@ -123,91 +123,70 @@ func (n *Node) Start(ctx context.Context) error {
 		}
 	}
 
-	// Zeroconf mDNS
+	// mDNS 交给外部 discovery.Mdns，Node只订阅事件
 	if n.cfg.EnableZeroconf {
-		h := sha256.New()
-		h.Write([]byte(n.cfg.Token))
-		tokenHash := fmt.Sprintf("%x", h.Sum(nil))
-
-		_, portStr, err := net.SplitHostPort(n.cfg.ListenAddr)
+		mdnsSvc, err := discovery.NewMdns(n.cfg.Token, n.cfg.ListenAddr)
 		if err != nil {
-			return fmt.Errorf("parse listen addr: %w", err)
+			return fmt.Errorf("init mdns: %w", err)
 		}
-		port, err := strconv.Atoi(portStr)
-		if err != nil {
-			return fmt.Errorf("parse port: %w", err)
+		if err := mdnsSvc.Start(ctx); err != nil {
+			return fmt.Errorf("start mdns: %w", err)
 		}
+		// 保存到node，方便Stop
+		n.mdns = mdnsSvc
 
-		rid := RandomBatchID()
-		instanceName := "rp2p-" + fmt.Sprintf("%x", rid[:])
-		txtRecords := []string{
-			fmt.Sprintf("token_hash=%s", tokenHash),
-			fmt.Sprintf("quic_addr=%s", n.cfg.ListenAddr),
-		}
-
-		server, err := zeroconf.Register(
-			instanceName,
-			"_rp2p._udp",
-			"local.",
-			port,
-			txtRecords,
-			nil,
-		)
-		if err != nil {
-			return fmt.Errorf("zeroconf register failed: %w", err)
-		}
-		n.zcServer = server
-
-		browseCtx, cancel := context.WithCancel(context.Background())
-		n.zcCancel = cancel
-
-		entries := make(chan *zeroconf.ServiceEntry)
+		// 单独协程消费mdns事件
 		go func() {
-			resolver, err := zeroconf.NewResolver(nil)
-			if err != nil {
-				fmt.Printf("[zeroconf] new resolver err: %v\n", err)
-				return
-			}
-			err = resolver.Browse(browseCtx, "_rp2p._udp", "local.", entries)
-			if err != nil {
-				fmt.Printf("[zeroconf] browse err: %v\n", err)
-			}
-		}()
-
-		go func() {
-			for entry := range entries {
-				txt := parseTxtKV(entry.Text)
-				peerTokenHash, ok := txt["token_hash"]
-				if !ok {
-					continue
+			for evt := range mdnsSvc.Events() {
+				switch evt.Type {
+				case discovery.MdnsEventFound:
+					fmt.Printf("[zeroconf] discovered peer: %s\n", evt.QUICAddr)
+					go func(a string) {
+						_, err := n.DialPeerIfNotExistWithSource(a, "zeroconf")
+						if err != nil {
+							fmt.Printf("[zeroconf] dial %s err: %v\n", a, err)
+						}
+					}(evt.QUICAddr)
+				case discovery.MdnsEventLost:
+					fmt.Printf("[zeroconf] peer lost: %s\n", evt.QUICAddr)
+					// 可选：标记discoveredPeers为下线，由Dial逻辑判断重连
 				}
-				peerQUICAddr, ok := txt["quic_addr"]
-				if !ok {
-					continue
-				}
-				if peerTokenHash != tokenHash {
-					continue
-				}
-				if peerQUICAddr == n.cfg.ListenAddr {
-					continue
-				}
-				if len(entry.AddrIPv4) == 0 {
-					fmt.Printf("[zeroconf] peer gone: %s\n", peerQUICAddr)
-					continue
-				}
-
-				fmt.Printf("[zeroconf] discovered peer: %s\n", peerQUICAddr)
-				go func(a string) {
-					_, err := n.DialPeerIfNotExistWithSource(a, "zeroconf")
-					if err != nil {
-						fmt.Printf("[zeroconf] dial %s err: %v\n", a, err)
-					}
-				}(peerQUICAddr)
 			}
 		}()
 	}
 
 	return nil
+}
+
+// SendFileToPeer 发送文件到指定远端peer地址
+func (n *Node) SendFileToPeer(remoteAddr string, filePath string, compress bool) error {
+	n.peersLock.Lock()
+	sess, ok := n.peers[remoteAddr]
+	n.peersLock.Unlock()
+	if !ok {
+		return fmt.Errorf("peer %s not connected", remoteAddr)
+	}
+	return sess.SendFile(filePath, compress)
+}
+
+// SendFileToAllPeers 广播发送给所有已连接peer
+func (n *Node) SendFileToAllPeers(filePath string, compress bool) {
+	n.peersLock.Lock()
+	// 拷贝快照，避免长时间持有锁
+	all := make([]*PeerSession, 0, len(n.peers))
+	for _, v := range n.peers {
+		all = append(all, v)
+	}
+	n.peersLock.Unlock()
+
+	for _, sess := range all {
+		s := sess
+		go func() {
+			if err := s.SendFile(filePath, compress); err != nil {
+				log.Printf("broadcast send file err: %v", err)
+			}
+		}()
+	}
 }
 
 func (n *Node) listenLoop(ctx context.Context) {
@@ -236,31 +215,58 @@ func parseTxtKV(txt []string) map[string]string {
 	return out
 }
 
+func (n *Node) addPeer(remoteAddr string, sess *PeerSession) {
+	n.peersLock.Lock()
+	n.peers[remoteAddr] = sess
+	n.peersLock.Unlock()
+}
+
+func (n *Node) removePeer(remoteAddr string) {
+	n.peersLock.Lock()
+	delete(n.peers, remoteAddr)
+	n.peersLock.Unlock()
+}
+
 func (n *Node) handleConn(ctx context.Context, conn quic.Connection) {
-	ctrlStream, err := conn.OpenStreamSync(ctx)
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("handleConn panic recovered: %v", r)
+			_ = conn.CloseWithError(99, "panic")
+		}
+	}()
+
+	// incoming 连接：必须 AcceptStream，而不是 OpenStreamSync
+	ctrlStream, err := conn.AcceptStream(ctx)
 	if err != nil {
-		_ = conn.CloseWithError(0, "open ctrl stream fail")
+		_ = conn.CloseWithError(0, "accept ctrl stream fail")
 		return
 	}
+
 	sess := NewPeerSession(ctx, conn, ctrlStream, n.cfg.Token, n.resumeStore, n.taskMgr,
 		n.cfg.RecvDir, n.cfg.ThumbDir, n.eventHub,
 		NewTokenBucket(n.cfg.PeerRateLimit), n.globalBucket, n.globalTraffic)
-	if !sess.Handshake() {
-		_ = conn.CloseWithError(1, "auth failed")
+
+	// 握手超时保护
+	hsCtx, hsCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer hsCancel()
+	handshakeOK := make(chan bool, 1)
+	go func() {
+		handshakeOK <- sess.Handshake()
+	}()
+	select {
+	case ok := <-handshakeOK:
+		if !ok {
+			_ = conn.CloseWithError(1, "auth failed")
+			return
+		}
+	case <-hsCtx.Done():
+		_ = conn.CloseWithError(2, "handshake timeout")
 		return
 	}
+
 	remote := conn.RemoteAddr().String()
 
-	n.peersLock.Lock()
-	n.peers[remote] = sess
-	n.peersLock.Unlock()
-
-	n.discoveryLock.Lock()
-	n.discoveredPeers[remote] = PeerMetaInfo{
-		Addr:   remote,
-		Source: "incoming",
-	}
-	n.discoveryLock.Unlock()
+	n.addPeer(remote, sess)
 
 	rawUp, _ := json.Marshal(map[string]string{"addr": remote})
 	n.eventHub.Publish(&Event{
@@ -270,14 +276,11 @@ func (n *Node) handleConn(ctx context.Context, conn quic.Connection) {
 	})
 	n.publishPeerDiscovery(remote, "incoming")
 
+	// 阻塞运行会话，直到连接断开
 	sess.Run()
 
-	n.peersLock.Lock()
-	delete(n.peers, remote)
-	n.peersLock.Unlock()
-	n.discoveryLock.Lock()
-	delete(n.discoveredPeers, remote)
-	n.discoveryLock.Unlock()
+	// 会话退出后清理在线peer
+	n.removePeer(remote)
 
 	rawDown, _ := json.Marshal(map[string]string{"addr": remote})
 	n.eventHub.Publish(&Event{
@@ -307,9 +310,7 @@ func (n *Node) dialPeer(ctx context.Context, addr string) (*PeerSession, error) 
 		return nil, fmt.Errorf("handshake failed")
 	}
 	remote := conn.RemoteAddr().String()
-	n.peersLock.Lock()
-	n.peers[remote] = sess
-	n.peersLock.Unlock()
+	n.addPeer(remote, sess)
 
 	rawUp, _ := json.Marshal(map[string]string{"addr": remote})
 	n.eventHub.Publish(&Event{
@@ -351,6 +352,9 @@ func (n *Node) Stop() {
 	}
 	if n.zcCancel != nil {
 		n.zcCancel()
+	}
+	if n.mdns != nil {
+		n.mdns.Stop()
 	}
 }
 

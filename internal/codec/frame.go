@@ -35,6 +35,18 @@ type Frame struct {
 	Body      []byte
 }
 
+type TaskReqPayload struct {
+	Name        string `json:"name"`
+	Total       int64  `json:"total"`
+	Sha256      string `json:"sha256"`
+	IsFolder    bool   `json:"is_folder"`
+	ClaimOffset int64  `json:"claim_offset"`
+}
+
+type TaskResumePayload struct {
+	SafeOffset int64 `json:"safe_offset"`
+}
+
 func ReadFrame(r io.Reader) (*Frame, error) {
 	var hdr [HeaderSize]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {

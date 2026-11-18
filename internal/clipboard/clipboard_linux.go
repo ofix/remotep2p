@@ -1,4 +1,5 @@
 //go:build linux && !android
+
 package clipboard
 
 import (
@@ -7,22 +8,26 @@ import (
 	"strings"
 )
 
-func newImpl() Clip { return &LinuxClip{} }
-type LinuxClip struct{}
+func newImpl() Clipboard { return &LinuxClipboard{} }
 
-func (l *LinuxClip) ReadText() (string, error) {
+type LinuxClipboard struct{}
+
+func (l *LinuxClipboard) ReadText() (string, error) {
 	cmd := exec.Command("xclip", "-sel", "clipboard", "-o")
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	err := cmd.Run()
 	return out.String(), err
 }
-func (l *LinuxClip) WriteText(s string) error {
+
+func (l *LinuxClipboard) WriteText(s string) error {
 	cmd := exec.Command("xclip", "-sel", "clipboard", "-i")
 	cmd.Stdin = bytes.NewBufferString(s)
 	return cmd.Run()
 }
-func (l *LinuxClip) ReadImage() ([]byte, error) {
+
+// 直接返回 PNG bytes，和接口对齐
+func (l *LinuxClipboard) ReadImage() ([]byte, error) {
 	cmd := exec.Command("xclip", "-sel", "clipboard", "-o", "-t", "image/png")
 	var out bytes.Buffer
 	cmd.Stdout = &out
@@ -32,7 +37,15 @@ func (l *LinuxClip) ReadImage() ([]byte, error) {
 	}
 	return out.Bytes(), nil
 }
-func (l *LinuxClip) ReadFileList() ([]string, error) {
+
+// 写入 PNG bytes
+func (l *LinuxClipboard) WriteImage(pngData []byte) error {
+	cmd := exec.Command("xclip", "-sel", "clipboard", "-i", "-t", "image/png")
+	cmd.Stdin = bytes.NewBuffer(pngData)
+	return cmd.Run()
+}
+
+func (l *LinuxClipboard) ReadFileList() ([]string, error) {
 	cmd := exec.Command("xclip", "-sel", "clipboard", "-o", "-t", "text/uri-list")
 	var out bytes.Buffer
 	cmd.Stdout = &out
@@ -46,8 +59,8 @@ func (l *LinuxClip) ReadFileList() ([]string, error) {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		// file:// URI 转本地路径，简单版
-		list = append(list, strings.TrimPrefix(line, "file://"))
+		line = strings.TrimPrefix(line, "file://")
+		list = append(list, line)
 	}
 	return list, nil
 }

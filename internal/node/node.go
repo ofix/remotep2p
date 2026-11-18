@@ -506,7 +506,7 @@ func (tb *TokenBucket) Take(n int64) bool {
 func (n *Node) GlobalTraffic() *TrafficStat { return n.globalTraffic }
 
 func (n *Node) trafficReportLoop(ctx context.Context) {
-	ticker := time.NewTicker(1 * time.Second)
+	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {

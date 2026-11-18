@@ -1,7 +1,9 @@
 package node
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,25 +11,26 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/quic-go/quic-go"
 	"remotep2p/internal/codec"
 	"remotep2p/internal/resume"
 	"remotep2p/internal/transfer"
+
+	"github.com/quic-go/quic-go"
 )
 
 type PeerSession struct {
-	ctx         context.Context
-	conn        quic.Connection
-	ctrlStr     quic.Stream
-	token       string
-	resumeSt    *resume.Store
-	taskMgr     *TaskManager
-	recvDir     string
-	thumbDir    string
-	eventHub    *EventHub
-	peerBucket  *TokenBucket
-	globalBucket *TokenBucket
-	traffic     *TrafficStat
+	ctx           context.Context
+	conn          quic.Connection
+	ctrlStr       quic.Stream
+	token         string
+	resumeSt      *resume.Store
+	taskMgr       *TaskManager
+	recvDir       string
+	thumbDir      string
+	eventHub      *EventHub
+	peerBucket    *TokenBucket
+	globalBucket  *TokenBucket
+	traffic       *TrafficStat
 	globalTraffic *TrafficStat
 }
 
@@ -84,17 +87,17 @@ func (s *PeerSession) onCtrlFrame(f *codec.Frame) {
 	case codec.FrameClipText:
 		fmt.Printf("[ClipText] peer: %s\n%s\n", from, string(f.Body))
 		raw, _ := json.Marshal(map[string]any{"text": string(f.Body)})
-		s.eventHub.Publish(&Event{Type: EvClipText, From: from, Data: raw})
+		s.eventHub.Publish(&Event{Type: EvClipText, From: from, Data: json.RawMessage(raw)})
 	case codec.FrameClipImage:
 		fmt.Printf("[ClipImage] peer: %s, png len: %d\n", from, len(f.Body))
 		raw, _ := json.Marshal(map[string]any{"size": len(f.Body)})
-		s.eventHub.Publish(&Event{Type: EvClipImage, From: from, Data: raw})
+		s.eventHub.Publish(&Event{Type: EvClipImage, From: from, Data: json.RawMessage(raw)})
 	case codec.FrameClipFiles:
 		var list []string
 		if err := json.Unmarshal(f.Body, &list); err == nil {
 			fmt.Printf("[ClipFiles] peer: %s, files: %+v\n", from, list)
 			raw, _ := json.Marshal(map[string]any{"files": list})
-			s.eventHub.Publish(&Event{Type: EvClipFiles, From: from, Data: raw})
+			s.eventHub.Publish(&Event{Type: EvClipFiles, From: from, Data: json.RawMessage(raw)})
 		}
 	case codec.FrameTaskReq:
 		go s.startRecvTask(f)
@@ -106,28 +109,28 @@ func (s *PeerSession) onCtrlFrame(f *codec.Frame) {
 		s.taskMgr.MarkDone(f.BatchID)
 		_ = s.resumeSt.Delete(f.BatchID)
 		raw, _ := json.Marshal(map[string]any{"batch_id": fmt.Sprintf("%x", f.BatchID)})
-		s.eventHub.Publish(&Event{Type: EvTaskDone, From: from, Data: raw})
+		s.eventHub.Publish(&Event{Type: EvTaskDone, From: from, Data: json.RawMessage(raw)})
 	case codec.FrameTaskErr:
 		fmt.Printf("task %x error: %s\n", f.BatchID, string(f.Body))
 		raw, _ := json.Marshal(map[string]any{"batch_id": fmt.Sprintf("%x", f.BatchID), "err": string(f.Body)})
-		s.eventHub.Publish(&Event{Type: EvTaskError, From: from, Data: raw})
+		s.eventHub.Publish(&Event{Type: EvTaskError, From: from, Data: json.RawMessage(raw)})
 	}
 }
 
-// WriteFrame 发送前限流 + 统计tx
+// WriteFrame 发送前限流 + 统计tx，适配 codec.WriteFrame 接口
 func (s *PeerSession) WriteFrame(f *codec.Frame) error {
-	bs, err := codec.MarshalFrame(f)
-	if err != nil {
+	var buf bytes.Buffer
+	if err := codec.WriteFrame(&buf, f); err != nil {
 		return err
 	}
-	n := int64(len(bs))
+	n := int64(buf.Len())
 	if s.peerBucket != nil {
 		s.peerBucket.Take(n)
 	}
 	if s.globalBucket != nil {
 		s.globalBucket.Take(n)
 	}
-	_, err = s.ctrlStr.Write(bs)
+	_, err := s.ctrlStr.Write(buf.Bytes())
 	s.traffic.AddTx(n)
 	s.globalTraffic.AddTx(n)
 	return err
@@ -135,18 +138,21 @@ func (s *PeerSession) WriteFrame(f *codec.Frame) error {
 
 func (s *PeerSession) Run() {
 	defer s.conn.CloseWithError(0, "session exit")
-	buf := make([]byte, 65536)
 	for {
-		f, err := codec.ReadFrame(s.ctrlStr, buf)
+		f, err := codec.ReadFrame(s.ctrlStr)
 		if err != nil {
 			if err != io.EOF {
 				fmt.Println("read frame err:", err)
 			}
 			return
 		}
-		rxN := int64(codec.FrameSize(f))
-		s.traffic.AddRx(rxN)
-		s.globalTraffic.AddRx(rxN)
+		// 计算收到帧的大小用于RX统计
+		var buf bytes.Buffer
+		if err := codec.WriteFrame(&buf, f); err == nil {
+			rxN := int64(buf.Len())
+			s.traffic.AddRx(rxN)
+			s.globalTraffic.AddRx(rxN)
+		}
 		s.onCtrlFrame(f)
 	}
 }

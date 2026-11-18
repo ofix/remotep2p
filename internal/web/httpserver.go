@@ -7,7 +7,6 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/json"
-	"fmt"
 	"io/fs"
 	"math/big"
 	"net/http"
@@ -16,6 +15,7 @@ import (
 	"remotep2p/internal/clipboard"
 	"remotep2p/internal/config"
 	"remotep2p/internal/node"
+
 	"github.com/gorilla/websocket"
 )
 
@@ -91,7 +91,7 @@ func apiClipRead(w http.ResponseWriter, r *http.Request) {
 }
 
 func apiClipReadImage(w http.ResponseWriter, r *http.Request) {
-	png, err := clipboard.ReadImage()
+	png, err := clipboard.Instance.ReadImage()
 	if err != nil || png == nil {
 		http.Error(w, "no image", 404)
 		return

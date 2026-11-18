@@ -115,6 +115,10 @@
         </div>
         <pre id="clipPreview"></pre>
     </div>
+    <div class="card" style="padding:12px;margin:8px 0;background:#fff;border-radius:10px;border:1px solid #e5e7eb;">
+        <div style="font-weight:bold;margin-bottom:8px;">在线节点</div>
+        <div id="peerList"></div>
+    </div>
     <div class="card">
         <h3>实时事件（WebSocket）</h3>
         <div id="eventLog"></div>
@@ -131,17 +135,38 @@
         const logDiv = document.getElementById('log');
         const eventDiv = document.getElementById('eventLog');
         let ws;
+        let peers = new Map();
 
-        function log (s) {
+        function renderPeerList() {
+            const wrap = document.getElementById("peerList");
+            if (peers.size === 0) {
+                wrap.innerHTML = "<div style='color:#666'>暂无在线节点</div>";
+                return;
+            }
+            let html = "";
+            for (const [addr, p] of peers) {
+                let tagColor = p.source === "zeroconf" ? "#22c55e" : "#3b82f6";
+                let tagText = p.source === "zeroconf" ? "mDNS自动发现" : "静态配置";
+                html += `
+    <div style="display:flex;align-items:center;justify-content:space-between;padding:6px 8px;background:#f8fafc;border-radius:6px;margin:4px 0;">
+      <span>${addr}</span>
+      <span style="font-size:12px;color:white;padding:2px 6px;border-radius:999;background:${tagColor}">${tagText}</span>
+    </div>`;
+            }
+            wrap.innerHTML = html;
+        }
+
+
+        function log(s) {
             logDiv.innerHTML += new Date().toLocaleTimeString() + ' ' + s + '\n';
             logDiv.scrollTop = logDiv.scrollHeight;
         }
-        function evLog (s) {
+        function evLog(s) {
             eventDiv.innerHTML += new Date().toLocaleTimeString() + ' ' + s + '\n';
             eventDiv.scrollTop = eventDiv.scrollHeight;
         }
 
-        function connectWS () {
+        function connectWS() {
             const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
             ws = new WebSocket(`${proto}//${location.host}/ws`);
             ws.onopen = () => evLog("✅ WS connected");
@@ -151,19 +176,48 @@
             };
             ws.onmessage = (e) => {
                 const ev = JSON.parse(e.data);
-                evLog(`[${ev.type}] from ${ev.From || ev.from}: ${JSON.stringify(ev.Data || ev.data)}`);
+                evLog(`[${ev.type}] ${JSON.stringify(ev.data)}`);
+
+                if (ev.type === "traffic_stats") {
+                    const g = ev.data.global;
+                    document.getElementById('rx').innerText = formatBytes(g.rx);
+                    document.getElementById('tx').innerText = formatBytes(g.tx);
+                } else if (ev.type === "task_start") {
+                    tasks.set(ev.data.batch_id, { ...ev.data, error: null });
+                    renderTaskList();
+                } else if (ev.type === "task_progress") {
+                    const t = tasks.get(ev.data.batch_id);
+                    if (t) tasks.set(ev.data.batch_id, { ...t, ...ev.data });
+                    renderTaskList();
+                } else if (ev.type === "task_done") {
+                    const t = tasks.get(ev.data.batch_id, { ...ev.data, percent: 100 });
+                    if (t) tasks.set(ev.data.batch_id, { ...t, percent: 100 });
+                    renderTaskList();
+                    setTimeout(() => { tasks.delete(ev.data.batch_id); renderTaskList() }, 3000);
+                } else if (ev.type === "task_error") {
+                    const t = tasks.get(ev.data.batch_id);
+                    if (t) tasks.set(ev.data.batch_id, { ...t, error: ev.data.err });
+                    renderTaskList();
+                } else if (ev.type === "discovery_peer") {
+                    peers.set(ev.data.addr, ev.data);
+                    renderPeerList();
+                } else if (ev.type === "peer_down") {
+                    peers.delete(ev.data.addr);
+                    renderPeerList();
+                }
             };
+
         }
         connectWS();
 
-        async function readClip () {
+        async function readClip() {
             const res = await fetch('/api/clip/read');
             const data = await res.json();
             document.getElementById('clipText').value = data.text;
             document.getElementById('clipPreview').innerText = JSON.stringify(data, null, 2);
             log('读取剪贴板成功');
         }
-        async function sendClipText () {
+        async function sendClipText() {
             const text = document.getElementById('clipText').value;
             await fetch('/api/clip/send/text', {
                 method: 'POST',
@@ -172,7 +226,7 @@
             })
             log('发送剪贴板文本：' + text);
         }
-        function renderCap () {
+        function renderCap() {
             const ua = navigator.userAgent;
             let cap = '';
             if (ua.includes('Win')) cap = '<span class="badge ok">Win:文本+图片+文件剪贴板</span>';
@@ -183,4 +237,5 @@
         renderCap();
     </script>
 </body>
+
 </html>

@@ -54,7 +54,8 @@ func GenSelfSignedTLS() (*tls.Config, error) {
 		Certificate: [][]byte{der},
 		PrivateKey:  priv,
 	}
-	return &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{"hq2"}}, nil
+	return &tls.Config{InsecureSkipVerify: true, // ✅ 加上这一行，消除这个校验报错
+		Certificates: []tls.Certificate{cert}, NextProtos: []string{"hq2"}}, nil
 }
 
 func StartHTTPS(cfg *config.Config) {
@@ -71,11 +72,15 @@ func StartHTTPS(cfg *config.Config) {
 	mux.HandleFunc("/api/file/send", apiSendFile)
 
 	srv := http.Server{
-		Addr:      cfg.HTTPSAddr,
-		TLSConfig: cfg.TLSConf,
-		Handler:   mux,
+		Addr: cfg.HTTPSAddr,
+		// TLSConfig: cfg.TLSConf,
+		Handler: mux,
 	}
-	_ = srv.ListenAndServeTLS("", "")
+
+	// _ = srv.ListenAndServeTLS("", "")
+
+	// 直接指定证书路径，内部自动构造TLSConfig
+	_ = srv.ListenAndServeTLS("server.crt", "server.key")
 }
 
 func apiClipRead(w http.ResponseWriter, r *http.Request) {

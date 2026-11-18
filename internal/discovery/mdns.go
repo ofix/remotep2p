@@ -32,7 +32,6 @@ type Mdns struct {
 	instanceName string
 	tokenHash    string
 	port         int
-	quicAddr     string
 
 	server  *zeroconf.Server
 	cancel  context.CancelFunc
@@ -41,20 +40,11 @@ type Mdns struct {
 
 // NewMdns 新建mDNS实例
 // token: 验证密钥
-// listenQUICAddr: 本机监听地址，格式 "0.0.0.0:8443"
-func NewMdns(token string, listenQUICAddr string) (*Mdns, error) {
+// quicPort: QUIC监听端口，例如8443
+func NewMdns(token string, quicPort int) (*Mdns, error) {
 	h := sha256.New()
 	h.Write([]byte(token))
 	tokenHash := fmt.Sprintf("%x", h.Sum(nil))
-
-	_, portStr, err := net.SplitHostPort(listenQUICAddr)
-	if err != nil {
-		return nil, fmt.Errorf("split host port: %w", err)
-	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		return nil, fmt.Errorf("parse port: %w", err)
-	}
 
 	var rid [4]byte
 	if _, err := rand.Read(rid[:]); err != nil {
@@ -65,8 +55,7 @@ func NewMdns(token string, listenQUICAddr string) (*Mdns, error) {
 	return &Mdns{
 		instanceName: instanceName,
 		tokenHash:    tokenHash,
-		port:         port,
-		quicAddr:     listenQUICAddr,
+		port:         quicPort,
 		eventCh:      make(chan *MdnsEvent, 16),
 	}, nil
 }
@@ -75,7 +64,6 @@ func NewMdns(token string, listenQUICAddr string) (*Mdns, error) {
 func (m *Mdns) Start(ctx context.Context) error {
 	txtRecords := []string{
 		fmt.Sprintf("token_hash=%s", m.tokenHash),
-		fmt.Sprintf("quic_addr=%s", m.quicAddr),
 	}
 
 	server, err := zeroconf.Register(
@@ -87,64 +75,75 @@ func (m *Mdns) Start(ctx context.Context) error {
 		nil,
 	)
 	if err != nil {
-		return err
+		return fmt.Errorf("zeroconf register fail: %w", err)
 	}
 	m.server = server
+	fmt.Printf("[mdns] ✅ 自身服务发布成功, instance=%s, port=%d\n", m.instanceName, m.port)
 
 	browseCtx, cancel := context.WithCancel(ctx)
 	m.cancel = cancel
 
-	entries := make(chan *zeroconf.ServiceEntry)
+	entries := make(chan *zeroconf.ServiceEntry, 8)
 
 	// 浏览协程
 	go func() {
 		resolver, err := zeroconf.NewResolver(nil)
 		if err != nil {
-			fmt.Printf("[mdns] resolver init err: %v\n", err)
+			fmt.Printf("[mdns] ❌ resolver init err: %v\n", err)
 			return
 		}
+		fmt.Println("[mdns] ✅ 浏览器已启动，等待局域网节点广播...")
 		err = resolver.Browse(browseCtx, "_rp2p._udp", "local.", entries)
 		if err != nil {
-			fmt.Printf("[mdns] browse err: %v\n", err)
+			fmt.Printf("[mdns] ❌ browse err: %v\n", err)
 		}
+		fmt.Println("[mdns] 浏览协程退出")
 	}()
 
 	// 消费发现事件协程
 	go func() {
 		for entry := range entries {
+			fmt.Printf("[mdns raw] 收到广播包 | instance=%s | IPv4=%v | txt=%v\n",
+				entry.Instance, entry.AddrIPv4, entry.Text)
+
+			// 过滤自己
+			if entry.Instance == m.instanceName {
+				fmt.Println("[mdns] ↩️ 跳过自己")
+				continue
+			}
 			txt := parseTxtKV(entry.Text)
 			peerTokenHash, ok := txt["token_hash"]
 			if !ok {
-				continue
-			}
-			peerQUICAddr, ok := txt["quic_addr"]
-			if !ok {
-				continue
-			}
-			// 过滤自己
-			if peerQUICAddr == m.quicAddr {
+				fmt.Println("[mdns] ⚠️ 广播包缺少token_hash，忽略")
 				continue
 			}
 			// token hash不匹配直接跳过
 			if peerTokenHash != m.tokenHash {
+				fmt.Printf("[mdns] ⚠️ token_hash不匹配，本地:%s 对端:%s\n", m.tokenHash, peerTokenHash)
 				continue
 			}
 
 			if len(entry.AddrIPv4) == 0 {
+				// 下线事件：缺少IP
 				m.eventCh <- &MdnsEvent{
 					Type:      MdnsEventLost,
-					QUICAddr:  peerQUICAddr,
+					QUICAddr:  "",
 					TokenHash: peerTokenHash,
 				}
+				fmt.Println("[mdns] 📌 收到节点下线事件")
 				continue
 			}
+			ip := entry.AddrIPv4[0].String()
+			peerQUICAddr := net.JoinHostPort(ip, strconv.Itoa(m.port))
 
 			m.eventCh <- &MdnsEvent{
 				Type:      MdnsEventFound,
 				QUICAddr:  peerQUICAddr,
 				TokenHash: peerTokenHash,
 			}
+			fmt.Printf("[mdns] 🎯 发现对端节点！QUIC地址=%s\n", peerQUICAddr)
 		}
+		fmt.Println("[mdns] entries通道关闭，事件消费协程退出")
 	}()
 
 	return nil
@@ -162,6 +161,7 @@ func (m *Mdns) Stop() {
 	}
 	if m.server != nil {
 		m.server.Shutdown()
+		fmt.Println("[mdns] 服务注销，发送goodbye下线包")
 	}
 	close(m.eventCh)
 }

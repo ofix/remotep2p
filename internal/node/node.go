@@ -125,7 +125,8 @@ func (n *Node) Start(ctx context.Context) error {
 
 	// mDNS 交给外部 discovery.Mdns，Node只订阅事件
 	if n.cfg.EnableZeroconf {
-		mdnsSvc, err := discovery.NewMdns(n.cfg.Token, n.cfg.ListenAddr)
+		fmt.Println("[Mdns] start discovery")
+		mdnsSvc, err := discovery.NewMdns(n.cfg.Token, 8443)
 		if err != nil {
 			return fmt.Errorf("init mdns: %w", err)
 		}

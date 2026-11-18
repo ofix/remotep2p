@@ -18,7 +18,7 @@ func main() {
 	var (
 		listen    = flag.String("listen", ":8443", "quic listen addr")
 		peerList  = flag.String("peer", "", "peer addr, comma split")
-		token     = flag.String("token", "default123", "auth token")
+		token     = flag.String("token", "P2P123", "auth token")
 		recvDir   = flag.String("recv", "./recv", "receive dir")
 		csvPath   = flag.String("csv", "./history.csv", "history csv path")
 		resumeDir = flag.String("resume", "./resume", "resume meta dir")
@@ -49,15 +49,16 @@ func main() {
 		}
 	}
 	cfg := &config.Config{
-		ListenAddr: *listen,
-		Peers:      peers,
-		Token:      *token,
-		RecvDir:    *recvDir,
-		CSVPath:    *csvPath,
-		ResumeDir:  *resumeDir,
-		ThumbDir:   *thumbDir,
-		HTTPSAddr:  *httpsAddr,
-		TLSConf:    tlsConf,
+		ListenAddr:     *listen,
+		Peers:          peers,
+		Token:          *token,
+		RecvDir:        *recvDir,
+		CSVPath:        *csvPath,
+		ResumeDir:      *resumeDir,
+		ThumbDir:       *thumbDir,
+		HTTPSAddr:      *httpsAddr,
+		TLSConf:        tlsConf,
+		EnableZeroconf: true,
 	}
 
 	n := node.NewNode(cfg)

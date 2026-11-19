@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"encoding/hex"
 
 	"remotep2p/internal/codec"
 	"remotep2p/internal/config"
@@ -293,58 +294,105 @@ func (n *Node) handleConn(ctx context.Context, conn quic.Connection) {
 }
 
 func (n *Node) dialPeer(ctx context.Context, addr string) (*PeerSession, error) {
-	conn, err := quic.DialAddr(ctx, addr, n.cfg.TLSConf, nil)
+	// 1. 配置 QUIC 参数 (关键修复！)
+	quicConf := &quic.Config{
+		KeepAlivePeriod: 5 * time.Second, // <--- 必须加：定期发送 Ping 保持 NAT 映射活跃
+		MaxIdleTimeout:  30 * time.Second,
+		HandshakeIdleTimeout: 10 * time.Second,
+	}
+
+	// 2. 执行拨号
+	conn, err := quic.DialAddr(ctx, addr, n.cfg.TLSConf, quicConf)
 	if err != nil {
-		fmt.Println("dial peer err:", err)
+		fmt.Printf("[Dial] ❌ Failed to connect to %s: %v\n", addr, err)
 		return nil, err
 	}
-	ctrlStream, err := conn.OpenStreamSync(ctx)
+	fmt.Printf("[Dial] 🤝 QUIC connection established with %s\n", addr)
+
+	// 3. 打开控制流 (用于应用层握手)
+	// 注意：使用带有超时的 Context，防止无限等待
+	streamCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	ctrlStream, err := conn.OpenStreamSync(streamCtx)
+	cancel()
 	if err != nil {
-		_ = conn.CloseWithError(0, "open ctrl stream fail")
-		return nil, err
+		conn.CloseWithError(0, "open ctrl stream fail")
+		return nil, fmt.Errorf("open control stream failed: %w", err)
 	}
+
+	// 4. 创建会话对象
 	sess := NewPeerSession(ctx, conn, ctrlStream, n.cfg.Token, n.resumeStore, n.taskMgr,
 		n.cfg.RecvDir, n.cfg.ThumbDir, n.eventHub,
 		NewTokenBucket(n.cfg.PeerRateLimit), n.globalBucket, n.globalTraffic)
-	if !sess.Handshake() {
-		_ = conn.CloseWithError(1, "auth failed")
-		return nil, fmt.Errorf("handshake failed")
-	}
-	remote := conn.RemoteAddr().String()
-	n.addPeer(remote, sess)
 
-	rawUp, _ := json.Marshal(map[string]string{"addr": remote})
-	n.eventHub.Publish(&Event{
-		Type: EvPeerUp,
-		From: remote,
-		Data: json.RawMessage(rawUp),
-	})
+	// 5. 执行应用层握手 (Auth)
+	if !sess.Handshake() {
+		conn.CloseWithError(1, "auth failed")
+		return nil, fmt.Errorf("application handshake failed")
+	}
+	
+	remote := conn.RemoteAddr().String()
+	fmt.Printf("[Dial] ✅ Auth success with %s\n", remote)
+
+	// 6. 启动会话后台协程 (处理读写)
 	go sess.Run()
+
+	// 7. 返回会话，由外层函数负责添加到 n.peers (避免内部锁竞争)
+	// 注意：这里不再调用 n.addPeer，而是返回 sess，让 DialPeerIfNotExistWithSource 去加锁添加
 	return sess, nil
 }
+
 
 func (n *Node) DialPeerIfNotExistWithSource(addr, source string) (*PeerSession, error) {
 	addr = strings.TrimSpace(addr)
 	if addr == "" {
 		return nil, fmt.Errorf("empty addr")
 	}
+
 	n.peersLock.Lock()
-	_, exists := n.peers[addr]
-	n.peersLock.Unlock()
-	if exists {
-		return nil, fmt.Errorf("peer already exists")
-	}
-	sess, err := n.dialPeer(context.Background(), addr)
-	if err == nil {
-		n.discoveryLock.Lock()
-		n.discoveredPeers[addr] = PeerMetaInfo{
-			Addr:   addr,
-			Source: source,
+	// 检查是否已存在
+	if sess, ok := n.peers[addr]; ok {
+		// 检查连接是否存活
+		if sess.conn.Context().Err() == nil {
+			n.peersLock.Unlock()
+			return sess, nil
 		}
-		n.discoveryLock.Unlock()
-		n.publishPeerDiscovery(addr, source)
+		// 如果死了，删除旧记录
+		delete(n.peers, addr)
 	}
-	return sess, err
+	n.peersLock.Unlock()
+
+	// 拨号
+	sess, err := n.dialPeer(context.Background(), addr)
+	if err != nil {
+		return nil, err
+	}
+
+	// 再次加锁添加 (双重检查)
+	n.peersLock.Lock()
+	// 防止在 dial 期间其他协程已经连上了
+	if existingSess, ok := n.peers[addr]; ok {
+		if existingSess.conn.Context().Err() == nil {
+			sess.conn.CloseWithError(0, "duplicate") // 关闭新建立的重复连接
+			n.peersLock.Unlock()
+			return existingSess, nil
+		}
+		delete(n.peers, addr)
+	}
+	
+	n.peers[addr] = sess
+	n.peersLock.Unlock()
+
+	// 更新发现信息
+	n.discoveryLock.Lock()
+	n.discoveredPeers[addr] = PeerMetaInfo{
+		Addr:   addr,
+		Source: source,
+	}
+	n.discoveryLock.Unlock()
+	
+	n.publishPeerDiscovery(addr, source)
+	
+	return sess, nil
 }
 
 func (n *Node) Stop() {
@@ -413,6 +461,7 @@ func (n *Node) publishPeerDown(addr string) {
 }
 
 func (n *Node) BroadcastClipText(text string) error {
+	fmt.Printf("[BroadcastClipText] text=%q, len=%d\n", text, len(text))
 	frame := &codec.Frame{
 		FrameType: codec.FrameClipText,
 		BatchID:   RandomBatchID(),
@@ -420,6 +469,13 @@ func (n *Node) BroadcastClipText(text string) error {
 		Flags:     0,
 		Body:      []byte(text),
 	}
+	fmt.Printf("[BroadcastClipText] frame: type=%d, batchID=%x, bodyLen=%d, flags=0x%x, bodyHex=%s\n",
+		frame.FrameType,
+		frame.BatchID,
+		frame.BodyLen,
+		frame.Flags,
+		hex.EncodeToString(frame.Body),
+	)
 	return n.broadcastFrame(frame)
 }
 
@@ -452,6 +508,10 @@ func (n *Node) BroadcastClipFiles(files []string) error {
 func (n *Node) broadcastFrame(f *codec.Frame) error {
 	n.peersLock.Lock()
 	defer n.peersLock.Unlock()
+	
+	fmt.Printf("[broadcastFrame] frameType=%d batchID=%s bodyLen=%d, peer count=%d\n",
+		f.FrameType, f.BatchID, f.BodyLen, len(n.peers))
+
 	for _, s := range n.peers {
 		if err := s.WriteFrame(f); err != nil {
 			fmt.Printf("broadcast write frame err: %v\n", err)

@@ -55,7 +55,7 @@ func GenSelfSignedTLS() (*tls.Config, error) {
 		PrivateKey:  priv,
 	}
 	return &tls.Config{InsecureSkipVerify: true, // ✅ 加上这一行，消除这个校验报错
-		Certificates: []tls.Certificate{cert}, NextProtos: []string{"hq2"}}, nil
+		Certificates: []tls.Certificate{cert}, NextProtos: []string{"h3"}}, nil
 }
 
 func StartHTTPS(cfg *config.Config) {
